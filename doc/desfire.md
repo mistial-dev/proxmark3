@@ -548,6 +548,8 @@ When the command is disabled - CommitReaderID returns an error.
 
 *write to data file with CommitReaderID and decode previous reader ID:*
 
+**Note about CommitReaderID in MAC mode:** If CommitReaderID fails with permission or length errors in MAC mode, the command will automatically retry in plain mode for better compatibility with different card configurations. This auto-fallback mechanism ensures reliable operation across various DESFire implementations.
+
 step 1. read mac file or read all the files to get transaction mac counter
 
 `hf mfdes read --aid 123456 --fid 0f` - read mac file
@@ -557,6 +559,140 @@ step 1. read mac file or read all the files to get transaction mac counter
 step 2. write something to a file with CommitReaderID command and provide the key that was set by `hf mfdes createmacfile` command
 
 `hf mfdes write --aid 123456 --fid 01 -d 01020304 --readerid 010203 --trkey 00112233445566778899aabbccddeeff`
+
+#### Enhanced Transaction MAC Commands (EV2/EV3)
+
+The following commands provide enhanced Transaction MAC workflow support with improved security and validation:
+
+*validate TMAC context and configuration:*
+
+`hf mfdes validatetmac --aid 123456` - validate Transaction MAC context for application 123456
+
+`hf mfdes validatetmac --aid 123456 --schann ev2` - validate using EV2 secure channel
+
+*get TMAC counter and value directly:*
+
+`hf mfdes gettmac --aid 123456 --fid 01` - get TMAC counter and value from file 01
+
+`hf mfdes gettmac --aid 123456 --fid 01 --schann lrp` - get TMAC using LRP secure channel
+
+*execute CommitReaderID with secure encryption:*
+
+`hf mfdes commitreaderid --aid 123456 --rid 1122334455667788` - commit reader ID with secure encryption
+
+`hf mfdes commitreaderid --aid 123456 --rid 1122334455667788 --schann ev2` - commit using EV2 channel
+
+#### Enhanced Features in EV2/EV3 Mode
+
+When working with EV2/EV3 cards, the following enhancements are automatically enabled:
+
+- **Transaction Identifier (TI) Validation**: Automatic validation of TI consistency during sessions
+- **Enhanced IV Generation**: TI-based IV generation with TMAC counter integration for improved security
+- **Enhanced CMAC Calculation**: TMAC-aware CMAC calculation with enhanced counter handling
+- **Automatic TMAC Context Management**: Context automatically updated when switching applications
+
+These enhancements provide better security and are compatible with all existing DESFire commands.
+
+#### Transaction MAC File Format and Analysis
+
+Transaction MAC files (file type 0x05) store transaction security information with the following 12-byte structure:
+
+**File Structure:**
+```
+Offset 0-3:  Transaction Counter (4 bytes, little-endian)
+Offset 4-11: Transaction MAC Value (8 bytes)
+```
+
+**Analyzing TMAC Files:**
+
+*comprehensive TMAC file analysis with human-readable output:*
+
+`hf mfdes analyzetmac --aid 123456 --fid 01` - analyze TMAC file structure, counter status, and access rights
+
+`hf mfdes analyzetmac --aid 123456 --fid 01 -v` - verbose analysis with detailed file settings and counter interpretation
+
+`hf mfdes analyzetmac --aid 123456 --fid 01 --txlog -v` - complete transaction context with analysis
+
+**Analysis Output Includes:**
+- Transaction counter value and status (initialized, active, maximum)
+- Transaction MAC value and validation
+- Access rights interpretation (CommitReaderID requirements)
+- File settings and security configuration
+- LRP channel support with split counter handling
+- Context validation against current session state
+
+**Counter States:**
+- `0x00000000`: Initialized (never used)
+- `0x00000001-0xFFFFFFFE`: Active (number indicates transaction count)
+- `0xFFFFFFFF`: Maximum reached (requires attention)
+
+**Access Rights for CommitReaderID:**
+- `rwAccess = 0x0F`: CommitReaderID disabled
+- `rwAccess = 0x0E`: CommitReaderID free access (no authentication)
+- `rwAccess = 0x0-0x4`: CommitReaderID requires authentication with specified key
+
+#### EV2/EV3 Card Compatibility
+
+**Full Backward Compatibility:** EV3 cards work seamlessly with EV2 implementations. The key differences:
+
+- **EV2 Cards**: Support Transaction MAC files with basic functionality
+- **EV3 Cards**: Enhanced Transaction MAC with improved security features
+- **Implementation**: Both use the same `EV2` secure channel (`--schann ev2`)
+
+**Testing EV2 Features on EV3 Cards:**
+
+All EV2 commands work identically on EV3 cards:
+
+`hf mfdes auth --aid 123456 --schann ev2` - EV2 authentication works on both EV2 and EV3
+
+`hf mfdes commitreaderid --aid 123456 --rid 1122334455667788 --schann ev2` - CommitReaderID identical on both
+
+`hf mfdes validatetmac --aid 123456 --schann ev2` - TMAC validation works for both card types
+
+**Enhanced Features Available on Both:**
+- Transaction Identifier (TI) validation
+- Enhanced IV generation with TMAC counter integration  
+- Enhanced CMAC calculation with transaction context
+- Automatic TMAC context management
+- CommitReaderID with encrypted previous ReaderID (EncTMRI)
+
+**Version Detection:**
+```
+EV2: Type=0x01, Major=0x22, Minor=0x00
+EV3: Type=0x01, Major=0x33, Minor=0x00
+```
+
+Both versions receive identical security treatment through the unified EV2 secure channel implementation.
+
+**EV2/EV3 Protocol Enhancements:**
+
+The EV2/EV3 secure channel provides several critical improvements over EV1:
+
+- **Enhanced Transaction Identifier (ETI)**: Integrates TMAC counter with TI for improved replay protection
+- **DACEV2 Channel**: Unified secure channel implementation for both EV2 and EV3 card types
+- **Encrypted TMRI (EncTMRI)**: Previous ReaderID encrypted in CommitReaderID responses for enhanced security
+- **Enhanced CMAC**: Transaction-aware CMAC calculation with improved key derivation
+- **Automatic Context Management**: Session state automatically maintained across application switches
+
+**Practical Testing Examples:**
+
+*verify card version and compatibility:*
+```
+pm3 --> hf mfdes info
+[+] Card Type         : MIFARE DESFire EV3 8k
+[+] Version           : Type=0x01, Major=0x33, Minor=0x00
+[+] Secure Channel    : EV2 (compatible)
+```
+
+*test EV2 features on EV3 card:*
+```
+pm3 --> hf mfdes auth --aid 123456 --schann ev2 -t aes
+[+] Authentication ( AES ) success.
+
+pm3 --> hf mfdes commitreaderid --aid 123456 --rid 1122334455667788
+[+] CommitReaderID ( 1122334455667788 ) success.
+[+] EncTMRI: 99AABBCCDDEEFF00
+```
 
 ### How to switch DESFire Light to LRP mode
 ^[Top](#top)

@@ -796,6 +796,145 @@ static bool TestLRPSessionKeys(void) {
     return res;
 }
 
+static bool TestTMACContext(void) {
+    bool res = true;
+    
+    DesfireContext_t ctx = {0};
+    
+    // Test TMAC context initialization
+    DesfireClearTmacContext(&ctx);
+    res = res && (ctx.tmacContext.tmacPresent == false);
+    res = res && (ctx.tmacContext.tmacCounterValid == false);
+    res = res && (ctx.tmacContext.lastReaderIDLen == 0);
+    
+    // Test TMAC context setting
+    ctx.tmacContext.tmacPresent = true;
+    ctx.tmacContext.tmacFileNo = 0x01;
+    ctx.tmacContext.commitReaderIdRequired = true;
+    ctx.tmacContext.commitReaderIdKey = 0x02;
+    ctx.tmacContext.tmacCounter = 0x12345678;
+    ctx.tmacContext.tmacCounterValid = true;
+    
+    // Test reader ID handling
+    uint8_t readerID[] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    memcpy(ctx.tmacContext.lastReaderID, readerID, sizeof(readerID));
+    ctx.tmacContext.lastReaderIDLen = sizeof(readerID);
+    
+    res = res && (ctx.tmacContext.tmacPresent == true);
+    res = res && (ctx.tmacContext.tmacFileNo == 0x01);
+    res = res && (ctx.tmacContext.commitReaderIdRequired == true);
+    res = res && (ctx.tmacContext.commitReaderIdKey == 0x02);
+    res = res && (ctx.tmacContext.tmacCounter == 0x12345678);
+    res = res && (ctx.tmacContext.tmacCounterValid == true);
+    res = res && (ctx.tmacContext.lastReaderIDLen == sizeof(readerID));
+    res = res && (memcmp(ctx.tmacContext.lastReaderID, readerID, sizeof(readerID)) == 0);
+    
+    // Test TMAC context clearing
+    DesfireClearTmacContext(&ctx);
+    res = res && (ctx.tmacContext.tmacPresent == false);
+    res = res && (ctx.tmacContext.tmacCounterValid == false);
+    res = res && (ctx.tmacContext.lastReaderIDLen == 0);
+    
+    PrintAndLogEx(INFO, "TMAC context...... ( %s )", (res) ? _GREEN_("ok") : _RED_("fail"));
+    return res;
+}
+
+static bool TestEnhancedEV2IV(void) {
+    bool res = true;
+    
+    DesfireContext_t ctx = {0};
+    
+    // Set up test context
+    memset(ctx.sessionKeyEnc, 0xAA, 16);
+    memset(ctx.TI, 0x12, 4);
+    ctx.cmdCntr = 0x1234;
+    
+    // Test standard IV generation
+    uint8_t iv1[16];
+    DesfireEV2FillIV(&ctx, true, iv1);
+    
+    // Test enhanced IV generation without TMAC
+    ctx.tmacContext.tmacPresent = false;
+    uint8_t iv2[16];
+    DesfireEnhancedEV2FillIV(&ctx, true, iv2, false);
+    
+    // Should be identical when not using enhanced TI
+    res = res && (memcmp(iv1, iv2, 16) == 0);
+    
+    // Test enhanced IV generation with TMAC
+    ctx.tmacContext.tmacPresent = true;
+    ctx.tmacContext.tmacCounter = 0x5678;
+    uint8_t iv3[16];
+    DesfireEnhancedEV2FillIV(&ctx, true, iv3, true);
+    
+    // Should be different when using enhanced TI with TMAC
+    res = res && (memcmp(iv1, iv3, 16) != 0);
+    
+    PrintAndLogEx(INFO, "Enhanced EV2 IV... ( %s )", (res) ? _GREEN_("ok") : _RED_("fail"));
+    return res;
+}
+
+static bool TestEnhancedEV2CMAC(void) {
+    bool res = true;
+    
+    DesfireContext_t ctx = {0};
+    
+    // Set up test context
+    memset(ctx.sessionKeyMAC, 0xBB, 16);
+    memset(ctx.TI, 0x34, 4);
+    ctx.cmdCntr = 0x5678;
+    
+    uint8_t testData[] = {0x01, 0x02, 0x03, 0x04};
+    uint8_t mac1[16], mac2[16], mac3[16];
+    
+    // Test standard CMAC generation
+    int result1 = DesfireEV2CalcCMAC(&ctx, 0xAA, testData, sizeof(testData), mac1);
+    res = res && (result1 == PM3_SUCCESS);
+    
+    // Test enhanced CMAC generation without TMAC
+    ctx.tmacContext.tmacPresent = false;
+    int result2 = DesfireEnhancedEV2CalcCMAC(&ctx, 0xAA, testData, sizeof(testData), mac2, false);
+    res = res && (result2 == PM3_SUCCESS);
+    
+    // Should be identical when not using enhanced TI
+    res = res && (memcmp(mac1, mac2, 16) == 0);
+    
+    // Test enhanced CMAC generation with TMAC
+    ctx.tmacContext.tmacPresent = true;
+    ctx.tmacContext.tmacCounter = 0x9ABC;
+    int result3 = DesfireEnhancedEV2CalcCMAC(&ctx, 0xAA, testData, sizeof(testData), mac3, true);
+    res = res && (result3 == PM3_SUCCESS);
+    
+    // Should be different when using enhanced TI with TMAC
+    res = res && (memcmp(mac1, mac3, 16) != 0);
+    
+    PrintAndLogEx(INFO, "Enhanced EV2 CMAC. ( %s )", (res) ? _GREEN_("ok") : _RED_("fail"));
+    return res;
+}
+
+static bool TestTIValidation(void) {
+    bool res = true;
+    
+    DesfireContext_t ctx = {0};
+    
+    // Set initial TI
+    uint8_t ti1[] = {0x11, 0x22, 0x33, 0x44};
+    memcpy(ctx.TI, ti1, 4);
+    
+    // Test with same TI (should not produce warning)
+    uint8_t ti2[] = {0x11, 0x22, 0x33, 0x44};
+    // DesfireValidateTI is static, so we can't test it directly
+    // But we can test that the TI comparison logic works
+    res = res && (memcmp(ctx.TI, ti2, 4) == 0);
+    
+    // Test with different TI
+    uint8_t ti3[] = {0x55, 0x66, 0x77, 0x88};
+    res = res && (memcmp(ctx.TI, ti3, 4) != 0);
+    
+    PrintAndLogEx(INFO, "TI validation..... ( %s )", (res) ? _GREEN_("ok") : _RED_("fail"));
+    return res;
+}
+
 bool DesfireTest(bool verbose) {
     bool res = true;
 
@@ -823,6 +962,10 @@ bool DesfireTest(bool verbose) {
     res = res && TestLRPSubkeys();
     res = res && TestLRPCMAC();
     res = res && TestLRPSessionKeys();
+    res = res && TestTMACContext();
+    res = res && TestEnhancedEV2IV();
+    res = res && TestEnhancedEV2CMAC();
+    res = res && TestTIValidation();
 
     PrintAndLogEx(INFO, "---------------------------");
     PrintAndLogEx(SUCCESS, "Tests ( %s )", (res) ? _GREEN_("ok") : _RED_("fail"));

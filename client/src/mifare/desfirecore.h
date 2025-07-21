@@ -274,4 +274,26 @@ int DesfireISOUpdateBinary(DesfireContext_t *dctx, bool use_file_id, uint8_t fil
 int DesfireISOReadRecords(DesfireContext_t *dctx, uint8_t recordnum, bool read_all_records, uint8_t fileid, uint8_t length, uint8_t *resp, size_t *resplen);
 int DesfireISOAppendRecord(DesfireContext_t *dctx, uint8_t fileid, uint8_t *data, size_t datalen);
 
+// Transaction MAC enhanced functions
+int DesfireCreateTransactionMacFileEx(DesfireContext_t *dctx, uint8_t fileno, uint8_t *data, size_t datalen);
+int DesfireGetTmacCounter(DesfireContext_t *dctx, uint8_t fileno, uint32_t *counter, uint8_t *tmacValue, size_t *tmacLen);
+int DesfireValidateTransactionContext(DesfireContext_t *dctx);
+
+// TMAC context management - uses lazy loading pattern (PM3 way)
+// Context is loaded on first TMAC operation, not on app selection
+int DesfireUpdateTmacContext(DesfireContext_t *dctx, uint32_t selectedAID);
+void DesfireClearTmacContext(DesfireContext_t *dctx);
+
+// Enhanced Transaction Identifier functions
+void DesfireEnhancedEV2FillIV(DesfireContext_t *ctx, bool ivforcommand, uint8_t *iv, bool useEnhancedTI);
+int DesfireEnhancedEV2CalcCMAC(DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *mac, bool useEnhancedTI);
+
+// Transaction logging and debugging
+void DesfirePrintTransactionLog(DesfireContext_t *dctx, const char *commandName, bool verbose);
+void DesfirePrintSessionState(DesfireContext_t *dctx);
+
+// TMAC file analysis and display
+void DesfirePrintTmacFileInfo(DesfireContext_t *dctx, uint8_t fileno, const uint8_t *data, size_t datalen, bool verbose);
+int DesfireAnalyzeTmacFile(DesfireContext_t *dctx, uint8_t fileno, bool verbose);
+
 #endif // __DESFIRECORE_H

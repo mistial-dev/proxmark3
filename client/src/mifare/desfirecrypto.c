@@ -52,6 +52,7 @@ void DesfireClearContext(DesfireContext_t *ctx) {
     memset(ctx->kdfInput, 0, sizeof(ctx->kdfInput));
 
     DesfireClearSession(ctx);
+    DesfireClearTmacContext(ctx);
 }
 
 void DesfireClearSession(DesfireContext_t *ctx) {
@@ -65,10 +66,25 @@ void DesfireClearSession(DesfireContext_t *ctx) {
     ctx->lastRequestZeroLen = false;
     ctx->cmdCntr = 0;
     memset(ctx->TI, 0, sizeof(ctx->TI));
+    
+    // TMAC context persists across authentication sessions within the same application
+    // It's only cleared when switching applications or explicitly via DesfireClearContext()
 }
 
 void DesfireClearIV(DesfireContext_t *ctx) {
     memset(ctx->IV, 0, sizeof(ctx->IV));
+}
+
+void DesfireClearTmacContext(DesfireContext_t *ctx) {
+    ctx->tmacContext.tmacContextLoaded = false;
+    ctx->tmacContext.tmacPresent = false;
+    ctx->tmacContext.tmacFileNo = 0;
+    ctx->tmacContext.commitReaderIdRequired = false;
+    ctx->tmacContext.commitReaderIdKey = 0;
+    ctx->tmacContext.tmacCounter = 0;
+    ctx->tmacContext.tmacCounterValid = false;
+    memset(ctx->tmacContext.lastReaderID, 0, sizeof(ctx->tmacContext.lastReaderID));
+    ctx->tmacContext.lastReaderIDLen = 0;
 }
 
 void DesfireSetKey(DesfireContext_t *ctx, uint8_t keyNum, DesfireCryptoAlgorithm keyType, uint8_t *key) {

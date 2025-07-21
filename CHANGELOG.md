@@ -20,6 +20,15 @@ This project uses the changelog in accordance with [keepchangelog](http://keepac
 - Changed `mem load` - now handles UL-C and UL-AES dictionary files (@iceman1001)
 - Changed `hf mfu sim` - now support UL-C simulation (@iceman1001)
 - Added `!` - run system commands from inside the client. Potentially dangerous if running client as SUDO, SU, ROOT (@iceman1001)
+- Added `hf mfdes gettmac` - retrieve Transaction MAC counter and value with context validation (@mistial-dev)
+- Added `hf mfdes commitreaderid` - execute CommitReaderID command with EncTMRI support (@mistial-dev)
+- Added `hf mfdes validatetmac` - validate Transaction MAC context and configuration (@mistial-dev)
+- Added `hf mfdes analyzetmac` - analyze Transaction MAC files in human-readable format (@mistial-dev)
+- Added comprehensive transaction logging with `--txlog` flag for enhanced DESFire debugging (@mistial-dev)
+- Added Enhanced Transaction Identifier (ETI) support with TMAC counter integration for EV2/EV3 cards (@mistial-dev)
+- Added `desfire_tmac` test suite in `pm3_online_tests.sh` with comprehensive TMAC workflow validation (@mistial-dev)
+- Enhanced DESFire documentation with Transaction MAC file format specification and EV2/EV3 compatibility details (@mistial-dev)
+- Fixed DESFire CommitReaderID hang in MAC mode - added auto-fallback to plain mode and improved error handling (@mistial-dev)
 
 ## [Daddy Iceman.4.20469][2025-06-16]
 - Fixed edge case in fm11rf08s key recovery tools (@doegox)

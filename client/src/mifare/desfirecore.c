@@ -26,6 +26,7 @@
 #include "desfirecore.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <util.h>
 #include "commonutil.h"
 #include "generator.h"
@@ -943,6 +944,9 @@ int DesfireSelectAID(DesfireContext_t *ctx, uint8_t *aid1, uint8_t *aid2) {
         DesfireClearSession(ctx);
         ctx->appSelected = (aid1[0] != 0x00 || aid1[1] != 0x00 || aid1[2] != 0x00);
         ctx->selectedAID = DesfireAIDByteToUint(aid1);
+        
+        // Clear TMAC context when switching applications
+        DesfireClearTmacContext(ctx);
 
         return PM3_SUCCESS;
     }
@@ -983,6 +987,9 @@ int DesfireSelectAIDHexNoFieldOn(DesfireContext_t *ctx, uint32_t aid) {
         DesfireClearSession(ctx);
         ctx->appSelected = (aid != 0x000000);
         ctx->selectedAID = aid;
+        
+        // Clear TMAC context when switching applications
+        DesfireClearTmacContext(ctx);
 
         return PM3_SUCCESS;
     }
@@ -1328,6 +1335,14 @@ static int DesfireAuthenticateEV1(DesfireContext_t *dctx, DesfireSecureChannel s
     return PM3_SUCCESS;
 }
 
+static void DesfireValidateTI(DesfireContext_t *dctx, const uint8_t *newTI) {
+    if (memcmp(dctx->TI, newTI, 4) != 0) {
+        PrintAndLogEx(WARNING, "Transaction Identifier changed during session");
+        PrintAndLogEx(INFO, "Previous TI: %s", sprint_hex(dctx->TI, 4));
+        PrintAndLogEx(INFO, "New TI:      %s", sprint_hex(newTI, 4));
+    }
+}
+
 static int DesfireAuthenticateEV2(DesfireContext_t *dctx, DesfireSecureChannel secureChannel, bool firstauth, bool verbose) {
     // Crypt constants
     uint8_t IV[16] = {0};
@@ -1441,6 +1456,8 @@ static int DesfireAuthenticateEV2(DesfireContext_t *dctx, DesfireSecureChannel s
     if (firstauth) {
         dctx->cmdCntr = 0;
         memcpy(dctx->TI, data, 4);
+    } else {
+        DesfireValidateTI(dctx, data);
     }
     DesfireClearIV(dctx);
     DesfireGenSessionKeyEV2(dctx->key, RndA, RndB, true, dctx->sessionKeyEnc);
@@ -1629,6 +1646,12 @@ static int DesfireAuthenticateLRP(DesfireContext_t *dctx, DesfireSecureChannel s
 
         dctx->cmdCntr = 0;
         memcpy(dctx->TI, data, 4);
+    } else {
+        LRPSetKeyEx(&ctx, sessionkey, dctx->IV, 4 * 2, 1, false);
+        size_t declen = 0;
+        LRPDecode(&ctx, recv_data, 16, data, &declen);
+        memcpy(dctx->IV, ctx.counter, 4);
+        DesfireValidateTI(dctx, data);
     }
 
     memcpy(dctx->sessionKeyEnc, sessionkey, CRYPTO_AES_BLOCK_SIZE);
@@ -2186,11 +2209,98 @@ int DesfireClearRecordFile(DesfireContext_t *dctx, uint8_t fnum) {
     return DesfireCommandTxData(dctx, MFDES_CLEAR_RECORD_FILE, &fnum, 1);
 }
 
+// Forward declaration
+static int DesfireEnsureTmacContext(DesfireContext_t *dctx);
+
 int DesfireCommitReaderID(DesfireContext_t *dctx, uint8_t *readerid, size_t readeridlen, uint8_t *resp, size_t *resplen) {
+    // Ensure TMAC context is loaded
+    int res = DesfireEnsureTmacContext(dctx);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(WARNING, "Failed to load TMAC context");
+        return res;
+    }
+    
     uint8_t rid[16] = {0};
     // command use 16b reader id only
     memcpy(rid, readerid, MIN(readeridlen, 16));
-    return DesfireCommand(dctx, MFDES_COMMIT_READER_ID, rid, 16, resp, resplen, -1);
+    
+    PrintAndLogEx(INFO, "CommitReaderID: sending %s", sprint_hex(rid, 16));
+    PrintAndLogEx(INFO, "  Secure channel: %d, key: %d", dctx->secureChannel, dctx->keyNum);
+    PrintAndLogEx(INFO, "  Comm mode: %d", dctx->commMode);
+    PrintAndLogEx(INFO, "  Authenticated: %s", DesfireIsAuthenticated(dctx) ? "YES" : "NO");
+    
+    // Check if we're in MACed mode - CommitReaderID requires it
+    /*
+    if (dctx->commMode != DCMMACed && dctx->commMode != DCMEncryptedWithPadding && dctx->commMode != DCMEncrypted) {
+        PrintAndLogEx(WARNING, "CommitReaderID requires MACed or Encrypted communication mode");
+        PrintAndLogEx(HINT, "Add '-m mac' or '-m encrypt' to your command");
+        return PM3_EINVARG;
+    }
+    */
+    
+    // Store Reader ID for TMAC validation
+    memcpy(dctx->tmacContext.lastReaderID, rid, 16);
+    dctx->tmacContext.lastReaderIDLen = 16;
+    
+    // When authenticated, CommitReaderID returns 16 bytes of EncTMRI (encrypted previous ReaderID)
+    // When not authenticated (free access), it returns only status
+    // IMPORTANT: The DesfireCommand function expects the length AFTER MAC stripping
+    // For MACed mode, the actual response has 8 additional MAC bytes that are validated and stripped
+    uint8_t xresp[32] = {0};
+    size_t xresplen = 0;
+    
+    // Use -1 to indicate variable length response to avoid strict length checking
+    // The MAC validation happens in DesfireSecureChannelDecode before length check
+    res = DesfireCommand(dctx, MFDES_COMMIT_READER_ID, rid, 16, xresp, &xresplen, -1);
+    
+    // Auto-detection fallback: if MAC mode fails with permission/length error, retry with plain mode
+    // This follows the PM3 pattern from value operations for better card compatibility
+    if ((res == 0x9D || res == 0x7E || res == -20) && dctx->commMode == DCMMACed) {
+        PrintAndLogEx(INFO, "MAC mode failed with error %02X, retrying with plain mode", res);
+        DesfireCommunicationMode original_mode = dctx->commMode;
+        dctx->commMode = DCMPlain;
+        
+        // Clear any potentially corrupted state
+        dctx->cmdCntr = 0;
+        
+        // Retry the command in plain mode
+        memset(xresp, 0, sizeof(xresp));
+        xresplen = 0;
+        res = DesfireCommand(dctx, MFDES_COMMIT_READER_ID, rid, 16, xresp, &xresplen, -1);
+        
+        // Restore original mode for future commands
+        dctx->commMode = original_mode;
+        
+        if (res == PM3_SUCCESS) {
+            PrintAndLogEx(SUCCESS, "CommitReaderID succeeded in plain mode fallback");
+        }
+    }
+    
+    if (res == PM3_EAPDU_FAIL) {
+        PrintAndLogEx(ERR, "CommitReaderID failed - check authentication and communication mode");
+        return res;
+    }
+    
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "CommitReaderID failed with result: %d", res);
+        // Clear TMAC context on error to prevent state corruption
+        DesfireClearTmacContext(dctx);
+        return res;
+    }
+    
+    // Verify we got the expected response length
+    if (DesfireIsAuthenticated(dctx) && xresplen != 16) {
+        PrintAndLogEx(ERR, "CommitReaderID unexpected response length: %zu (expected 16)", xresplen);
+        return PM3_EAPDU_FAIL;
+    }
+    
+    // Copy response data if provided
+    if (resp != NULL && resplen != NULL && xresplen > 0) {
+        memcpy(resp, xresp, xresplen);
+        *resplen = xresplen;
+    }
+    
+    return res;
 }
 
 int DesfireCommitTransactionEx(DesfireContext_t *dctx, bool enable_options, uint8_t options, uint8_t *resp, size_t *resplen) {
@@ -2208,6 +2318,169 @@ int DesfireCommitTransaction(DesfireContext_t *dctx, bool enable_options, uint8_
 
 int DesfireAbortTransaction(DesfireContext_t *dctx) {
     return DesfireCommandNoData(dctx, MFDES_ABORT_TRANSACTION);
+}
+
+// Enhanced Transaction MAC functions for EV2/EV3 security
+int DesfireCreateTransactionMacFileEx(DesfireContext_t *dctx, uint8_t fileno, uint8_t *data, size_t datalen) {
+    // Validate Transaction MAC file creation parameters
+    if (datalen < 6) {
+        PrintAndLogEx(ERR, "Transaction MAC file creation data too short");
+        return PM3_EINVARG;
+    }
+    
+    int res = DesfireCreateFile(dctx, 0x05, data, datalen, false); // File type 0x05 = Transaction MAC
+    if (res == PM3_SUCCESS) {
+        // Update TMAC context after successful creation
+        dctx->tmacContext.tmacPresent = true;
+        dctx->tmacContext.tmacFileNo = fileno;
+        dctx->tmacContext.tmacCounterValid = false; // Force re-read of counter
+        
+        // Parse access rights to determine CommitReaderID requirements
+        uint16_t accessRights = MemLeToUint2byte(&data[2]);
+        uint8_t commitReaderIdRights = (accessRights >> 12) & 0x0F;
+        dctx->tmacContext.commitReaderIdRequired = (commitReaderIdRights != 0x0F);
+        dctx->tmacContext.commitReaderIdKey = commitReaderIdRights;
+        
+        PrintAndLogEx(INFO, "Transaction MAC file created successfully");
+        PrintAndLogEx(INFO, "CommitReaderID %s (key %d)", 
+                     dctx->tmacContext.commitReaderIdRequired ? "required" : "disabled",
+                     dctx->tmacContext.commitReaderIdKey);
+    }
+    
+    return res;
+}
+
+int DesfireGetTmacCounter(DesfireContext_t *dctx, uint8_t fileno, uint32_t *counter, uint8_t *tmacValue, size_t *tmacLen) {
+    // Ensure TMAC context is loaded
+    int res = DesfireEnsureTmacContext(dctx);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+    
+    uint8_t resp[250] = {0};
+    size_t resplen = 0;
+    
+    // Read the TMAC file to get counter and MAC values
+    res = DesfireReadFile(dctx, fileno, 0, 0, resp, &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to read Transaction MAC file");
+        return res;
+    }
+    
+    if (resplen < 4) {
+        PrintAndLogEx(ERR, "Invalid Transaction MAC file response length");
+        return PM3_ESOFT;
+    }
+    
+    // Parse TMAC counter (4 bytes, little endian)
+    *counter = MemLeToUint4byte(resp);
+    dctx->tmacContext.tmacCounter = *counter;
+    dctx->tmacContext.tmacCounterValid = true;
+    
+    // Copy TMAC value if requested
+    if (tmacValue && tmacLen) {
+        size_t macLen = MIN(resplen - 4, *tmacLen);
+        memcpy(tmacValue, resp + 4, macLen);
+        *tmacLen = macLen;
+    }
+    
+    return PM3_SUCCESS;
+}
+
+
+int DesfireValidateTransactionContext(DesfireContext_t *dctx) {
+    // Ensure TMAC context is loaded
+    int res = DesfireEnsureTmacContext(dctx);
+    if (res != PM3_SUCCESS) {
+        return res;
+    }
+    
+    if (!dctx->tmacContext.tmacPresent) {
+        return PM3_SUCCESS; // No TMAC file, no validation needed
+    }
+    
+    if (dctx->tmacContext.commitReaderIdRequired && 
+        dctx->tmacContext.lastReaderIDLen == 0) {
+        PrintAndLogEx(WARNING, "Transaction MAC file requires CommitReaderID but none provided");
+        return PM3_ESOFT;
+    }
+    
+    if (!dctx->tmacContext.tmacCounterValid) {
+        PrintAndLogEx(DEBUG, "TMAC counter not read, validation skipped");
+    }
+    
+    return PM3_SUCCESS;
+}
+
+// Ensure TMAC context is loaded for the current application (lazy loading)
+static int DesfireEnsureTmacContext(DesfireContext_t *dctx) {
+    // If already loaded, nothing to do
+    if (dctx->tmacContext.tmacContextLoaded) {
+        return PM3_SUCCESS;
+    }
+    
+    // TMAC only applies to applications, not PICC level
+    if (!dctx->appSelected || dctx->selectedAID == 0x000000) {
+        // Mark as loaded to avoid repeated attempts
+        dctx->tmacContext.tmacContextLoaded = true;
+        return PM3_SUCCESS;
+    }
+    
+    // Load TMAC context for current application
+    return DesfireUpdateTmacContext(dctx, dctx->selectedAID);
+}
+
+int DesfireUpdateTmacContext(DesfireContext_t *dctx, uint32_t selectedAID) {
+    // Clear TMAC context when switching applications
+    DesfireClearTmacContext(dctx);
+    
+    // Check if the new application has a Transaction MAC file
+    uint8_t resp[250] = {0};
+    size_t resplen = 0;
+    
+    int res = DesfireGetFileIDList(dctx, resp, &resplen);
+    if (res != PM3_SUCCESS) {
+        return res; // Unable to get file list, context remains cleared
+    }
+    
+    // Scan file list for Transaction MAC files (type 0x05)
+    for (size_t i = 0; i < resplen; i++) {
+        uint8_t fileno = resp[i];
+        FileSettings_t fsettings;
+        
+        if (DesfireFileSettingsStruct(dctx, fileno, &fsettings) == PM3_SUCCESS) {
+            if (fsettings.fileType == 0x05) { // Transaction MAC file
+                dctx->tmacContext.tmacPresent = true;
+                dctx->tmacContext.tmacFileNo = fileno;
+                
+                // Parse access rights for CommitReaderID requirements
+                // For TMAC files, the ReadWrite access right has special meaning:
+                // - 0x0-0x4: CommitReaderID enabled, requires auth with specified key
+                // - 0xE: CommitReaderID enabled with free access  
+                // - 0xF: CommitReaderID disabled
+                uint8_t commitReaderIdRights = fsettings.rwAccess;
+                dctx->tmacContext.commitReaderIdRequired = (commitReaderIdRights != 0x0F);
+                dctx->tmacContext.commitReaderIdKey = commitReaderIdRights;
+                
+                PrintAndLogEx(INFO, "Found Transaction MAC file %02X in AID %06X", fileno, selectedAID);
+                PrintAndLogEx(INFO, "  Access rights: %04X (r:%X w:%X rw:%X ch:%X)", 
+                    fsettings.rawAccessRights, fsettings.rAccess, fsettings.wAccess, 
+                    fsettings.rwAccess, fsettings.chAccess);
+                PrintAndLogEx(INFO, "  CommitReaderID key: %s", 
+                    (commitReaderIdRights == 0x0F) ? "disabled" : 
+                    (commitReaderIdRights == 0x0E) ? "free access" : 
+                    sprint_hex_inrow(&commitReaderIdRights, 1));
+                PrintAndLogEx(INFO, "  CommitReaderID required: %s", 
+                    dctx->tmacContext.commitReaderIdRequired ? _GREEN_("YES") : _RED_("NO"));
+                break; // Only one TMAC file per application
+            }
+        }
+    }
+    
+    // Mark context as loaded
+    dctx->tmacContext.tmacContextLoaded = true;
+    
+    return PM3_SUCCESS;
 }
 
 int DesfireReadFile(DesfireContext_t *dctx, uint8_t fnum, uint32_t offset, uint32_t len, uint8_t *resp, size_t *resplen) {
@@ -2983,6 +3256,9 @@ int DesfireISOSelectEx(DesfireContext_t *dctx, bool fieldon, DesfireISOSelectCon
     DesfireClearSession(dctx);
     dctx->appSelected = !((cntr == ISSMFDFEF && datalen == 0) || (cntr == ISSEFByFileID && datalen == 2 && data[0] == 0 && data[1] == 0));
     dctx->selectedAID = 0;
+    
+    // Clear TMAC context when switching applications via ISO
+    DesfireClearTmacContext(dctx);
 
     return res;
 }
@@ -3155,4 +3431,361 @@ int DesfireSelectEx(DesfireContext_t *ctx, bool fieldon, DesfireISOSelectWay way
 
 int DesfireSelect(DesfireContext_t *ctx, DesfireISOSelectWay way, uint32_t id, char *dfname) {
     return DesfireSelectEx(ctx, true, way, id, dfname);
+}
+
+
+void DesfireEnhancedEV2FillIV(DesfireContext_t *ctx, bool ivforcommand, uint8_t *iv, bool useEnhancedTI) {
+    uint8_t xiv[CRYPTO_AES_BLOCK_SIZE] = {0};
+
+    if (ivforcommand) {
+        xiv[0] = 0xa5;
+        xiv[1] = 0x5a;
+    } else {
+        xiv[0] = 0x5a;
+        xiv[1] = 0xa5;
+    }
+
+    memcpy(xiv + 2, ctx->TI, 4);
+
+    if (useEnhancedTI && ctx->tmacContext.tmacPresent) {
+        Uint2byteToMemLe(xiv + 2 + 4, ctx->cmdCntr + ctx->tmacContext.tmacCounter);
+    } else {
+        Uint2byteToMemLe(xiv + 2 + 4, ctx->cmdCntr);
+    }
+
+    if (aes_encode(NULL, ctx->sessionKeyEnc, xiv, xiv, CRYPTO_AES_BLOCK_SIZE))
+        return;
+
+    if (iv == NULL)
+        memcpy(ctx->IV, xiv, CRYPTO_AES_BLOCK_SIZE);
+    else
+        memcpy(iv, xiv, CRYPTO_AES_BLOCK_SIZE);
+}
+
+int DesfireEnhancedEV2CalcCMAC(DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *mac, bool useEnhancedTI) {
+    uint8_t mdata[DESFIRE_BUFFER_SIZE] = {0};
+    size_t mdatalen = 0;
+
+    mdata[0] = cmd;
+    if (useEnhancedTI && ctx->tmacContext.tmacPresent) {
+        Uint2byteToMemLe(&mdata[1], ctx->cmdCntr + ctx->tmacContext.tmacCounter);
+    } else {
+        Uint2byteToMemLe(&mdata[1], ctx->cmdCntr);
+    }
+    memcpy(&mdata[3], ctx->TI, 4);
+    if (data != NULL && datalen > 0) {
+        memcpy(&mdata[7], data, datalen);
+    }
+
+    mdatalen = 1 + 2 + 4 + datalen;
+
+    return aes_cmac8(NULL, ctx->sessionKeyMAC, mdata, mac, mdatalen);
+}
+
+void DesfirePrintSessionState(DesfireContext_t *dctx) {
+    if (dctx == NULL) {
+        PrintAndLogEx(ERR, "NULL context");
+        return;
+    }
+    
+    PrintAndLogEx(INFO, _CYAN_("=== DESFire Session State ==="));
+    PrintAndLogEx(INFO, "App Selected     : %s", dctx->appSelected ? _GREEN_("YES") : _RED_("NO"));
+    if (dctx->appSelected) {
+        PrintAndLogEx(INFO, "Selected AID     : " _GREEN_("%06X"), dctx->selectedAID);
+    }
+    PrintAndLogEx(INFO, "Authenticated    : %s", DesfireIsAuthenticated(dctx) ? _GREEN_("YES") : _RED_("NO"));
+    if (DesfireIsAuthenticated(dctx)) {
+        PrintAndLogEx(INFO, "Key Number       : " _GREEN_("%d"), dctx->keyNum);
+        PrintAndLogEx(INFO, "Session Type     : %s", 
+                     (dctx->secureChannel == DACd40) ? "LegacyKDF" :
+                     (dctx->secureChannel == DACLRP) ? "LRP" :
+                     (dctx->secureChannel == DACEV1) ? "EV1" : 
+                     (dctx->secureChannel == DACEV2) ? "EV2" : "Unknown");
+        PrintAndLogEx(INFO, "Command Counter  : " _GREEN_("%d"), dctx->cmdCntr);
+        PrintAndLogEx(INFO, "Transaction ID   : " _GREEN_("%s"), sprint_hex(dctx->TI, 4));
+    }
+    PrintAndLogEx(INFO, "Comm Mode        : %s", 
+                 (dctx->commMode == DCMPlain) ? "Plain" :
+                 (dctx->commMode == DCMMACed) ? "MACed" :
+                 (dctx->commMode == DCMEncrypted) ? "Encrypted" : "Unknown");
+    
+    // TMAC Context
+    PrintAndLogEx(INFO, _CYAN_("=== Transaction MAC Context ==="));
+    PrintAndLogEx(INFO, "TMAC Present     : %s", dctx->tmacContext.tmacPresent ? _GREEN_("YES") : _RED_("NO"));
+    if (dctx->tmacContext.tmacPresent) {
+        PrintAndLogEx(INFO, "TMAC File Number : " _GREEN_("0x%02X"), dctx->tmacContext.tmacFileNo);
+        PrintAndLogEx(INFO, "CommitReaderID   : %s", dctx->tmacContext.commitReaderIdRequired ? _GREEN_("Required") : _RED_("Disabled"));
+        if (dctx->tmacContext.commitReaderIdRequired) {
+            PrintAndLogEx(INFO, "CommitReaderID Key: " _GREEN_("%d"), dctx->tmacContext.commitReaderIdKey);
+        }
+        PrintAndLogEx(INFO, "TMAC Counter     : %s", dctx->tmacContext.tmacCounterValid ? 
+                     sprint_hex_inrow((uint8_t*)&dctx->tmacContext.tmacCounter, 4) : _RED_("Not Read"));
+        if (dctx->tmacContext.lastReaderIDLen > 0) {
+            PrintAndLogEx(INFO, "Last Reader ID   : " _GREEN_("%s"), 
+                         sprint_hex(dctx->tmacContext.lastReaderID, dctx->tmacContext.lastReaderIDLen));
+        }
+    }
+    PrintAndLogEx(INFO, _CYAN_("=============================="));
+}
+
+void DesfirePrintTransactionLog(DesfireContext_t *dctx, const char *commandName, bool verbose) {
+    if (dctx == NULL || commandName == NULL) {
+        return;
+    }
+    
+    PrintAndLogEx(INFO, _YELLOW_("=== DESFire Transaction Log: %s ==="), commandName);
+    
+    // Always show basic transaction info
+    PrintAndLogEx(INFO, "Command          : " _CYAN_("%s"), commandName);
+    time_t now = time(NULL);
+    char timestr[32];
+    strftime(timestr, sizeof(timestr), "%H:%M:%S", localtime(&now));
+    PrintAndLogEx(INFO, "Timestamp        : " _GREEN_("%s"), timestr);
+    
+    if (dctx->appSelected) {
+        PrintAndLogEx(INFO, "Application      : " _GREEN_("0x%06X"), dctx->selectedAID);
+    }
+    
+    if (DesfireIsAuthenticated(dctx)) {
+        PrintAndLogEx(INFO, "Authentication   : " _GREEN_("Key %d (%s)"), dctx->keyNum,
+                     (dctx->secureChannel == DACd40) ? "Legacy" :
+                     (dctx->secureChannel == DACLRP) ? "LRP" :
+                     (dctx->secureChannel == DACEV1) ? "EV1" : 
+                     (dctx->secureChannel == DACEV2) ? "EV2" : "Unknown");
+        PrintAndLogEx(INFO, "Command Counter  : " _GREEN_("%d"), dctx->cmdCntr);
+        PrintAndLogEx(INFO, "Transaction ID   : " _GREEN_("%s"), sprint_hex(dctx->TI, 4));
+    } else {
+        PrintAndLogEx(INFO, "Authentication   : " _RED_("None"));
+    }
+    
+    PrintAndLogEx(INFO, "Communication    : %s", 
+                 (dctx->commMode == DCMPlain) ? _YELLOW_("Plain") :
+                 (dctx->commMode == DCMMACed) ? _GREEN_("MACed") :
+                 (dctx->commMode == DCMEncrypted) ? _CYAN_("Encrypted") : _RED_("Unknown"));
+    
+    // Show TMAC context if present
+    if (dctx->tmacContext.tmacPresent) {
+        PrintAndLogEx(INFO, "TMAC File        : " _GREEN_("0x%02X"), dctx->tmacContext.tmacFileNo);
+        if (dctx->tmacContext.tmacCounterValid) {
+            PrintAndLogEx(INFO, "TMAC Counter     : " _GREEN_("%u"), dctx->tmacContext.tmacCounter);
+        }
+        if (dctx->tmacContext.lastReaderIDLen > 0) {
+            PrintAndLogEx(INFO, "Reader ID        : " _GREEN_("%s"), 
+                         sprint_hex(dctx->tmacContext.lastReaderID, dctx->tmacContext.lastReaderIDLen));
+        }
+    }
+    
+    // Verbose mode: show detailed session state
+    if (verbose) {
+        PrintAndLogEx(INFO, _CYAN_("--- Detailed Session Information ---"));
+        if (DesfireIsAuthenticated(dctx)) {
+            PrintAndLogEx(INFO, "Session Key Enc  : " _YELLOW_("%s"), sprint_hex(dctx->sessionKeyEnc, 16));
+            PrintAndLogEx(INFO, "Session Key MAC  : " _YELLOW_("%s"), sprint_hex(dctx->sessionKeyMAC, 16));
+            PrintAndLogEx(INFO, "Current IV       : " _YELLOW_("%s"), sprint_hex(dctx->IV, 16));
+        }
+        
+        // Show recent command history summary
+        PrintAndLogEx(INFO, "Security Level   : %s",
+                     (dctx->secureChannel >= DACEV2) ? _GREEN_("EV2/EV3 Enhanced") :
+                     (dctx->secureChannel == DACEV1) ? _YELLOW_("EV1 Standard") :
+                     (dctx->secureChannel == DACLRP) ? _CYAN_("LRP") : 
+                     _RED_("Legacy/Basic"));
+        
+        if (dctx->tmacContext.tmacPresent) {
+            PrintAndLogEx(INFO, "TMAC Status      : %s", 
+                         dctx->tmacContext.commitReaderIdRequired ? 
+                         (dctx->tmacContext.lastReaderIDLen > 0 ? _GREEN_("Active & Committed") : _YELLOW_("Requires CommitReaderID")) :
+                         _CYAN_("Available"));
+        }
+    }
+    
+    PrintAndLogEx(INFO, _YELLOW_("====================================="));
+}
+
+void DesfirePrintTmacFileInfo(DesfireContext_t *dctx, uint8_t fileno, const uint8_t *data, size_t datalen, bool verbose) {
+    if (data == NULL || datalen == 0) {
+        PrintAndLogEx(ERR, "No TMAC file data provided");
+        return;
+    }
+    
+    PrintAndLogEx(INFO, _CYAN_("=== Transaction MAC File Analysis ==="));
+    PrintAndLogEx(INFO, "File Number      : " _GREEN_("0x%02X"), fileno);
+    PrintAndLogEx(INFO, "File Size        : " _GREEN_("%zu bytes"), datalen);
+    
+    if (datalen < 12) {
+        PrintAndLogEx(WARNING, "TMAC file too short (expected 12 bytes, got %zu)", datalen);
+        PrintAndLogEx(INFO, "Raw Data         : " _YELLOW_("%s"), sprint_hex(data, datalen));
+        return;
+    }
+    
+    if (datalen != 12) {
+        PrintAndLogEx(WARNING, "TMAC file unexpected size (expected 12 bytes, got %zu)", datalen);
+    }
+    
+    // Parse TMAC file structure
+    uint32_t tmacCounter = MemLeToUint4byte(data);
+    const uint8_t *tmacValue = data + 4;
+    
+    PrintAndLogEx(INFO, _CYAN_("--- TMAC File Structure ---"));
+    PrintAndLogEx(INFO, "Transaction Counter: " _GREEN_("%u") " (0x%08X)", tmacCounter, tmacCounter);
+    PrintAndLogEx(INFO, "Transaction MAC    : " _GREEN_("%s"), sprint_hex(tmacValue, 8));
+    
+    // LRP channel special handling
+    if (dctx && dctx->secureChannel == DACLRP) {
+        uint16_t actualTMC = MemLeToUint2byte(data);
+        uint16_t sessionTMC = MemLeToUint2byte(data + 2);
+        PrintAndLogEx(INFO, _CYAN_("--- LRP Counter Split ---"));
+        PrintAndLogEx(INFO, "Actual Counter   : " _GREEN_("%u") " (0x%04X)", actualTMC, actualTMC);
+        PrintAndLogEx(INFO, "Session Counter  : " _GREEN_("%u") " (0x%04X)", sessionTMC, sessionTMC);
+    }
+    
+    // Context validation
+    if (dctx && dctx->tmacContext.tmacPresent && dctx->tmacContext.tmacFileNo == fileno) {
+        PrintAndLogEx(INFO, _CYAN_("--- Context Information ---"));
+        PrintAndLogEx(INFO, "CommitReaderID   : %s", dctx->tmacContext.commitReaderIdRequired ? 
+                     _GREEN_("Required") : _RED_("Disabled"));
+        if (dctx->tmacContext.commitReaderIdRequired) {
+            PrintAndLogEx(INFO, "Required Key     : " _GREEN_("%d"), dctx->tmacContext.commitReaderIdKey);
+        }
+        
+        if (dctx->tmacContext.lastReaderIDLen > 0) {
+            PrintAndLogEx(INFO, "Last Reader ID   : " _GREEN_("%s"), 
+                         sprint_hex(dctx->tmacContext.lastReaderID, dctx->tmacContext.lastReaderIDLen));
+        }
+        
+        // Counter validation
+        if (dctx->tmacContext.tmacCounterValid && dctx->tmacContext.tmacCounter != tmacCounter) {
+            PrintAndLogEx(WARNING, "Counter mismatch: Context=%u, File=%u", 
+                         dctx->tmacContext.tmacCounter, tmacCounter);
+        }
+    }
+    
+    // Verbose mode: show additional analysis
+    if (verbose) {
+        PrintAndLogEx(INFO, _CYAN_("--- Detailed Analysis ---"));
+        PrintAndLogEx(INFO, "Raw File Data    : " _YELLOW_("%s"), sprint_hex(data, MIN(datalen, 12)));
+        
+        // Counter analysis
+        if (tmacCounter == 0) {
+            PrintAndLogEx(INFO, "Counter Status   : " _YELLOW_("Initialized (never used)"));
+        } else if (tmacCounter == 0xFFFFFFFF) {
+            PrintAndLogEx(WARNING, "Counter Status   : " _RED_("Maximum reached!"));
+        } else {
+            PrintAndLogEx(INFO, "Counter Status   : " _GREEN_("Active (%u transactions)"), tmacCounter);
+        }
+        
+        // MAC analysis
+        bool allZero = true;
+        bool allFF = true;
+        for (int i = 0; i < 8; i++) {
+            if (tmacValue[i] != 0x00) allZero = false;
+            if (tmacValue[i] != 0xFF) allFF = false;
+        }
+        
+        if (allZero) {
+            PrintAndLogEx(INFO, "MAC Status       : " _YELLOW_("Zeroed (new/cleared)"));
+        } else if (allFF) {
+            PrintAndLogEx(WARNING, "MAC Status       : " _RED_("All 0xFF (suspicious)"));
+        } else {
+            PrintAndLogEx(INFO, "MAC Status       : " _GREEN_("Contains data"));
+        }
+        
+        // Show extra data if file is larger than expected
+        if (datalen > 12) {
+            PrintAndLogEx(INFO, "Extra Data       : " _YELLOW_("%s"), sprint_hex(data + 12, datalen - 12));
+        }
+    }
+    
+    PrintAndLogEx(INFO, _CYAN_("===================================="));
+}
+
+int DesfireAnalyzeTmacFile(DesfireContext_t *dctx, uint8_t fileno, bool verbose, bool exportjson) {
+    if (dctx == NULL) {
+        PrintAndLogEx(ERR, "Invalid context");
+        return PM3_EINVARG;
+    }
+    
+    // Read the TMAC file
+    uint8_t resp[250] = {0};
+    size_t resplen = 0;
+    
+    int res = DesfireReadFile(dctx, fileno, 0, 0, resp, &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Failed to read TMAC file %02X: %d", fileno, res);
+        return res;
+    }
+    
+    // Get file settings for additional context
+    FileSettings_t fsettings;
+    bool hasSettings = (DesfireFileSettingsStruct(dctx, fileno, &fsettings) == PM3_SUCCESS);
+    
+    // Print comprehensive file analysis
+    DesfirePrintTmacFileInfo(dctx, fileno, resp, resplen, verbose);
+    
+    // Show file settings if available
+    if (hasSettings && verbose) {
+        PrintAndLogEx(INFO, _CYAN_("--- File Settings ---"));
+        PrintAndLogEx(INFO, "File Type        : " _GREEN_("0x%02X") " (Transaction MAC)", fsettings.fileType);
+        PrintAndLogEx(INFO, "File Size        : " _GREEN_("%d bytes"), fsettings.fileSize);
+        PrintAndLogEx(INFO, "Access Rights    : " _GREEN_("0x%04X"), fsettings.rawAccessRights);
+        PrintAndLogEx(INFO, "  Read Access    : " _GREEN_("0x%X"), fsettings.rAccess);
+        PrintAndLogEx(INFO, "  Write Access   : " _GREEN_("0x%X"), fsettings.wAccess);
+        PrintAndLogEx(INFO, "  ReadWrite Access: " _GREEN_("0x%X"), fsettings.rwAccess);
+        PrintAndLogEx(INFO, "  Change Access  : " _GREEN_("0x%X"), fsettings.chAccess);
+        
+        // Interpret CommitReaderID access rights
+        uint8_t commitRights = fsettings.rwAccess;
+        PrintAndLogEx(INFO, "CommitReaderID   : %s", 
+                     (commitRights == 0x0F) ? _RED_("Disabled") :
+                     (commitRights == 0x0E) ? _YELLOW_("Free Access") :
+                     _GREEN_("Key %d Required"), commitRights);
+    }
+    
+    // JSON export if requested
+    if (exportjson) {
+        char filename[100];
+        snprintf(filename, sizeof(filename), "tmac_file_%06X_%02X.json", 
+                dctx->selectedAID, fileno);
+        
+        FILE *f = fopen(filename, "w");
+        if (f != NULL) {
+            fprintf(f, "{\n");
+            fprintf(f, "  \"tmac_file_analysis\": {\n");
+            fprintf(f, "    \"application_id\": \"0x%06X\",\n", dctx->selectedAID);
+            fprintf(f, "    \"file_number\": \"0x%02X\",\n", fileno);
+            fprintf(f, "    \"file_size\": %zu,\n", resplen);
+            
+            if (resplen >= 12) {
+                uint32_t counter = MemLeToUint4byte(resp);
+                fprintf(f, "    \"transaction_counter\": %u,\n", counter);
+                fprintf(f, "    \"transaction_counter_hex\": \"0x%08X\",\n", counter);
+                fprintf(f, "    \"transaction_mac\": \"%s\",\n", sprint_hex_inrow(resp + 4, 8));
+            }
+            
+            fprintf(f, "    \"raw_data\": \"%s\",\n", sprint_hex_inrow(resp, resplen));
+            
+            if (hasSettings) {
+                fprintf(f, "    \"file_settings\": {\n");
+                fprintf(f, "      \"file_type\": \"0x%02X\",\n", fsettings.fileType);
+                fprintf(f, "      \"access_rights\": \"0x%04X\",\n", fsettings.rawAccessRights);
+                fprintf(f, "      \"commitreaderid_required\": %s\n", 
+                       (fsettings.rwAccess == 0x0F) ? "false" : "true");
+                fprintf(f, "    },\n");
+            }
+            
+            time_t now = time(NULL);
+            char timestr[32];
+            strftime(timestr, sizeof(timestr), "%H:%M:%S", localtime(&now));
+            fprintf(f, "    \"timestamp\": \"%s\"\n", timestr);
+            fprintf(f, "  }\n");
+            fprintf(f, "}\n");
+            fclose(f);
+            
+            PrintAndLogEx(SUCCESS, "TMAC file analysis exported to: " _GREEN_("%s"), filename);
+        } else {
+            PrintAndLogEx(ERR, "Failed to create JSON export file");
+        }
+    }
+    
+    return PM3_SUCCESS;
 }

@@ -86,11 +86,25 @@ typedef struct {
     bool lastRequestZeroLen;
     uint16_t cmdCntr;   // for AES
     uint8_t TI[4];      // for AES
+    
+    // Transaction MAC context for EV2/EV3 enhanced security
+    struct {
+        bool tmacContextLoaded;             // TMAC context has been loaded for current application
+        bool tmacPresent;                   // Transaction MAC file exists in current application
+        uint8_t tmacFileNo;                 // File number of TMAC file
+        bool commitReaderIdRequired;        // CommitReaderID command required for transactions
+        uint8_t commitReaderIdKey;          // Key number for CommitReaderID authentication
+        uint32_t tmacCounter;               // Current TMAC counter value
+        bool tmacCounterValid;              // TMAC counter has been read and is valid
+        uint8_t lastReaderID[16];           // Last used Reader ID for verification
+        size_t lastReaderIDLen;             // Length of last Reader ID
+    } tmacContext;
 } DesfireContext_t;
 
 void DesfireClearContext(DesfireContext_t *ctx);
 void DesfireClearSession(DesfireContext_t *ctx);
 void DesfireClearIV(DesfireContext_t *ctx);
+void DesfireClearTmacContext(DesfireContext_t *ctx);
 void DesfireSetKey(DesfireContext_t *ctx, uint8_t keyNum, DesfireCryptoAlgorithm keyType, uint8_t *key);
 void DesfireSetKeyNoClear(DesfireContext_t *ctx, uint8_t keyNum, DesfireCryptoAlgorithm keyType, uint8_t *key);
 void DesfireSetCommandSet(DesfireContext_t *ctx, DesfireCommandSet cmdSet);
@@ -126,6 +140,10 @@ void DesfireGenSessionKeyEV1(const uint8_t rnda[], const uint8_t rndb[], Desfire
 void DesfireGenSessionKeyEV2(uint8_t *key, uint8_t *rndA, uint8_t *rndB, bool enckey, uint8_t *sessionkey);
 void DesfireEV2FillIV(DesfireContext_t *ctx, bool ivforcommand, uint8_t *iv);
 int DesfireEV2CalcCMAC(DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *mac);
+
+// Enhanced EV2/EV3 functions with TMAC integration
+void DesfireEnhancedEV2FillIV(DesfireContext_t *ctx, bool ivforcommand, uint8_t *iv, bool useEnhancedTI);
+int DesfireEnhancedEV2CalcCMAC(DesfireContext_t *ctx, uint8_t cmd, uint8_t *data, size_t datalen, uint8_t *mac, bool useEnhancedTI);
 
 void DesfireGenTransSessionKeyEV2(uint8_t *key, uint32_t trCntr, uint8_t *uid, bool forMAC, uint8_t *sessionkey);
 void DesfireGenTransSessionKeyLRP(uint8_t *key, uint32_t trCntr, uint8_t *uid, bool forMAC, uint8_t *sessionkey);

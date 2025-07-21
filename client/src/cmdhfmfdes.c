@@ -405,32 +405,43 @@ static const char *getProductTypeStr(const uint8_t *versionhw) {
 }
 
 int mfdes_get_info(mfdes_info_res_t *info) {
+    DesfireContext_t dctx = {0};
+    dctx.cmdSet = DCCNative;
+    dctx.commMode = DCMPlain;
+    dctx.secureChannel = DACNone;
 
-    PacketResponseNG resp;
-    SendCommandNG(CMD_HF_DESFIRE_INFO, NULL, 0);
-    if (WaitForResponseTimeout(CMD_HF_DESFIRE_INFO, &resp, 1500) == false) {
-        PrintAndLogEx(WARNING, "command execution time out");
-        DropField();
-        return PM3_ETIMEOUT;
+    uint8_t resp[250] = {0};
+    size_t resplen = 0;
+    uint8_t respcode = 0;
+
+    // Select DESFire card (activate field)
+    int res = DesfireExchangeEx(true, &dctx, MFDES_GET_VERSION, NULL, 0, &respcode, resp, &resplen, true, 0);
+    if (res != PM3_SUCCESS || respcode != MFDES_S_OPERATION_OK || resplen < 8) {
+        return PM3_ESOFT;
     }
 
-    memcpy(info, resp.data.asBytes, sizeof(mfdes_info_res_t));
+    memcpy(info->versionHW, resp + 1, 7);
 
-    if (resp.status != PM3_SUCCESS) {
-
-        switch (info->isOK) {
-            case 1:
-                PrintAndLogEx(WARNING, "Can't select card");
-                break;
-            case 2:
-                PrintAndLogEx(WARNING, "Card is most likely not DESFire. Wrong size UID");
-                break;
-            case 3:
-            default:
-                PrintAndLogEx(WARNING, _RED_("Command unsuccessful"));
-                break;
-        }
+    // Additional frame 1
+    res = DesfireExchangeEx(false, &dctx, MFDES_ADDITIONAL_FRAME, NULL, 0, &respcode, resp, &resplen, true, 0);
+    if (res != PM3_SUCCESS || respcode != MFDES_S_OPERATION_OK || resplen < 8) {
         return PM3_ESOFT;
+    }
+
+    memcpy(info->versionSW, resp + 1, 7);
+
+    // Additional frame 2
+    res = DesfireExchangeEx(false, &dctx, MFDES_ADDITIONAL_FRAME, NULL, 0, &respcode, resp, &resplen, true, 0);
+    if (res != PM3_SUCCESS || respcode != MFDES_S_OPERATION_OK || resplen < 15) {
+        return PM3_ESOFT;
+    }
+
+    memcpy(info->details, resp + 1, 14);
+
+    // Get UID from current field state
+    if (DesfireGetCardUID(&dctx) == PM3_SUCCESS) {
+        memcpy(info->uid, dctx.uid, dctx.uidlen);
+        info->uidlen = dctx.uidlen;
     }
 
     return PM3_SUCCESS;
@@ -663,12 +674,10 @@ static int CmdHF14ADesInfo(const char *Cmd) {
     CLIParserFree(ctx);
 
     SetAPDULogging(false);
-    DropField();
 
     mfdes_info_res_t info;
     int res = mfdes_get_info(&info);
     if (res != PM3_SUCCESS) {
-        DropField();
         return res;
     }
 
@@ -2950,20 +2959,17 @@ static int CmdHF14ADesFormatPICC(const char *Cmd) {
 
     res = DesfireSelectAndAuthenticate(&dctx, securechann, appid, verbose);
     if (res != PM3_SUCCESS) {
-        DropField();
         return res;
     }
 
     res = DesfireFormatPICC(&dctx);
     if (res != PM3_SUCCESS) {
         PrintAndLogEx(ERR, "Desfire FormatPICC command " _RED_("error") ". Result: %d", res);
-        DropField();
         return PM3_ESOFT;
     }
 
     PrintAndLogEx(SUCCESS, "Desfire format: " _GREEN_("done!"));
 
-    DropField();
     return PM3_SUCCESS;
 }
 
@@ -4379,6 +4385,336 @@ static int CmdHF14ADesCreateTrMACFile(const char *Cmd) {
     }
 
     PrintAndLogEx(SUCCESS, "%s file %02x in the %s created " _GREEN_("successfully"), GetDesfireFileType(filetype), data[0], DesfireWayIDStr(selectway, id));
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesGetTMAC(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes gettmac",
+                  "Get Transaction MAC counter and value. Requires authentication.",
+                  "hf mfdes gettmac --aid 123456 --fid 01             -> get TMAC from file 01 in app 123456\n"
+                  "hf mfdes gettmac --aid 123456 --fid 01 -v          -> get TMAC with verbose output\n"
+                  "hf mfdes gettmac --isoid df01 --fid 01 --schann lrp -> get TMAC via LRP secure channel");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose",   "Verbose output"),
+        arg_lit0(NULL, "txlog",     "Show detailed transaction log"),
+        arg_int0("n",  "keyno",     "<dec>", "Key number"),
+        arg_str0("t",  "algo",      "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",       "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",       "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",      "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",     "<plain|mac|encrypt>", "Communication mode"),
+        arg_str0("c",  "ccset",     "<native|niso|iso>", "Communication command set"),
+        arg_str0(NULL, "schann",    "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 hex bytes, big endian)"),
+        arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_int0(NULL, "fid",       "<dec>", "File ID (1 hex byte)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool txlog = arg_get_lit(ctx, 3);
+
+    DesfireContext_t dctx;
+    int securechann = defaultSecureChannel;
+    uint32_t id = 0x000000;
+    DesfireISOSelectWay selectway = ISW6bAID;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, &securechann, DCMEncrypted, &id, &selectway);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    uint8_t fileid = arg_get_int_def(ctx, 14, 1);
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, false, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(FAILED, "Select or authentication %s " _RED_("failed") ". Result [%d] %s", 
+                      DesfireWayIDStr(selectway, id), res, DesfireAuthErrorToStr(res));
+        return res;
+    }
+
+    if (txlog) {
+        DesfirePrintTransactionLog(&dctx, "GetTMAC", verbose);
+    }
+
+    uint32_t counter = 0;
+    uint8_t tmacValue[16] = {0};
+    size_t tmacLen = 0;
+
+    res = DesfireGetTmacCounter(&dctx, fileid, &counter, tmacValue, &tmacLen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "Get TMAC counter " _RED_("error") ". Result: %d", res);
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    PrintAndLogEx(SUCCESS, "TMAC Counter: " _GREEN_("%u"), counter);
+    PrintAndLogEx(SUCCESS, "TMAC Value  : " _GREEN_("%s"), sprint_hex(tmacValue, tmacLen));
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesCommitReaderID(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes commitreaderid",
+                  "Execute CommitReaderID command. Requires MACed communication mode and proper authentication.\n"
+                  "This command is used with Transaction MAC files to identify the reader in transactions.",
+                  "hf mfdes commitreaderid --aid 123456 --rid 1122334455667788 -n 1 -t des -k KEY -m mac\n"
+                  "  -> commit reader ID with key 1 authentication and MACed mode\n"
+                  "hf mfdes commitreaderid --rid 1122334455667788 -m mac       -> use existing authenticated session");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose",   "Verbose output"),
+        arg_lit0(NULL, "txlog",     "Show detailed transaction log"),
+        arg_int0("n",  "keyno",     "<dec>", "Key number"),
+        arg_str0("t",  "algo",      "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",       "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",       "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",      "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",     "<plain|mac|encrypt>", "Communication mode"),
+        arg_str0("c",  "ccset",     "<native|niso|iso>", "Communication command set"),
+        arg_str0(NULL, "schann",    "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 hex bytes, big endian)"),
+        arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_str0(NULL, "rid",       "<hex>", "Reader ID (1-16 hex bytes)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool txlog = arg_get_lit(ctx, 3);
+
+    DesfireContext_t dctx;
+    int securechann = defaultSecureChannel;
+    uint32_t id = 0x000000;
+    DesfireISOSelectWay selectway = ISW6bAID;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, &securechann, DCMPlain, &id, &selectway);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    uint8_t readerid[16] = {0};
+    int readeridlen = 0;
+    CLIGetHexWithReturn(ctx, 14, readerid, &readeridlen);
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    if (readeridlen == 0 || readeridlen > 16) {
+        PrintAndLogEx(ERR, "Reader ID must be 1-16 bytes");
+        return PM3_EINVARG;
+    }
+
+    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, false, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(FAILED, "Select or authentication %s " _RED_("failed") ". Result [%d] %s", 
+                      DesfireWayIDStr(selectway, id), res, DesfireAuthErrorToStr(res));
+        return res;
+    }
+
+    if (txlog) {
+        DesfirePrintTransactionLog(&dctx, "CommitReaderID", verbose);
+    }
+
+    uint8_t resp[255] = {0};
+    size_t resplen = 0;
+
+    res = DesfireCommitReaderID(&dctx, readerid, readeridlen, resp, &resplen);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "CommitReaderID " _RED_("error") ". Result: %d", res);
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    PrintAndLogEx(SUCCESS, "CommitReaderID completed successfully");
+    if (resplen == 16) {
+        PrintAndLogEx(SUCCESS, "EncTMRI (Encrypted Previous ReaderID): %s", sprint_hex(resp, 16));
+        PrintAndLogEx(INFO, "  This is TMRIPrev encrypted with SesTMENCKey");
+        PrintAndLogEx(INFO, "  Used for tracking transaction chains in backend");
+    } else if (resplen > 0) {
+        PrintAndLogEx(INFO, "Response (%zu bytes): %s", resplen, sprint_hex(resp, resplen));
+    } else {
+        PrintAndLogEx(INFO, "No EncTMRI returned (not authenticated or free access)");
+    }
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesValidateTMAC(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes validatetmac",
+                  "Validate Transaction MAC context and current application state. Shows TMAC configuration.",
+                  "hf mfdes validatetmac --aid 123456              -> validate TMAC context for app 123456\n"
+                  "hf mfdes validatetmac --aid 123456 -v           -> validate with verbose output\n"
+                  "hf mfdes validatetmac --isoid df01 --schann lrp  -> validate via LRP secure channel");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose",   "Verbose output"),
+        arg_lit0(NULL, "txlog",     "Show detailed transaction log"),
+        arg_int0("n",  "keyno",     "<dec>", "Key number"),
+        arg_str0("t",  "algo",      "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",       "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",       "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",      "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",     "<plain|mac|encrypt>", "Communication mode"),
+        arg_str0("c",  "ccset",     "<native|niso|iso>", "Communication command set"),
+        arg_str0(NULL, "schann",    "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 hex bytes, big endian)"),
+        arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool txlog = arg_get_lit(ctx, 3);
+
+    DesfireContext_t dctx;
+    int securechann = defaultSecureChannel;
+    uint32_t id = 0x000000;
+    DesfireISOSelectWay selectway = ISW6bAID;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, &securechann, DCMPlain, &id, &selectway);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, false, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(FAILED, "Select or authentication %s " _RED_("failed") ". Result [%d] %s", 
+                      DesfireWayIDStr(selectway, id), res, DesfireAuthErrorToStr(res));
+        return res;
+    }
+
+    if (txlog) {
+        DesfirePrintTransactionLog(&dctx, "ValidateTMAC", verbose);
+    }
+
+    res = DesfireValidateTransactionContext(&dctx);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "TMAC validation " _RED_("error") ". Result: %d", res);
+        DropField();
+        return PM3_ESOFT;
+    }
+
+    PrintAndLogEx(SUCCESS, _GREEN_("Transaction MAC Context Validation"));
+    PrintAndLogEx(DEBUG, "DEBUG: tmacPresent=%d, tmacFileNo=%02X, commitReaderIdRequired=%d", 
+                  dctx.tmacContext.tmacPresent, dctx.tmacContext.tmacFileNo, 
+                  dctx.tmacContext.commitReaderIdRequired);
+    PrintAndLogEx(SUCCESS, "TMAC Present        : %s", dctx.tmacContext.tmacPresent ? _GREEN_("YES") : _RED_("NO"));
+    if (dctx.tmacContext.tmacPresent) {
+        PrintAndLogEx(SUCCESS, "TMAC File Number    : " _GREEN_("0x%02X"), dctx.tmacContext.tmacFileNo);
+        PrintAndLogEx(SUCCESS, "CommitReaderID Req  : %s", dctx.tmacContext.commitReaderIdRequired ? _GREEN_("YES") : _RED_("NO"));
+        if (dctx.tmacContext.commitReaderIdRequired) {
+            PrintAndLogEx(SUCCESS, "CommitReaderID Key  : " _GREEN_("0x%02X"), dctx.tmacContext.commitReaderIdKey);
+        }
+        PrintAndLogEx(SUCCESS, "TMAC Counter Valid  : %s", dctx.tmacContext.tmacCounterValid ? _GREEN_("YES") : _RED_("NO"));
+        if (dctx.tmacContext.tmacCounterValid) {
+            PrintAndLogEx(SUCCESS, "TMAC Counter        : " _GREEN_("%u"), dctx.tmacContext.tmacCounter);
+        }
+        if (dctx.tmacContext.lastReaderIDLen > 0) {
+            PrintAndLogEx(SUCCESS, "Last Reader ID      : " _GREEN_("%s"), 
+                          sprint_hex(dctx.tmacContext.lastReaderID, dctx.tmacContext.lastReaderIDLen));
+        }
+    }
+
+    DropField();
+    return PM3_SUCCESS;
+}
+
+static int CmdHF14ADesAnalyzeTMAC(const char *Cmd) {
+    CLIParserContext *ctx;
+    CLIParserInit(&ctx, "hf mfdes analyzetmac",
+                  "Analyze Transaction MAC file and display detailed information in human-readable format.\n"
+                  "Shows file structure, counter status, access rights, and optionally exports to JSON.",
+                  "hf mfdes analyzetmac --aid 123456 --fid 01              -> analyze TMAC file 01 in app 123456\n"
+                  "hf mfdes analyzetmac --aid 123456 --fid 01 -v           -> analyze with verbose output\n"
+                  "hf mfdes analyzetmac --aid 123456 --fid 01 --json       -> analyze and export to JSON\n"
+                  "hf mfdes analyzetmac --isoid df01 --fid 01 --schann lrp -> analyze via LRP secure channel");
+
+    void *argtable[] = {
+        arg_param_begin,
+        arg_lit0("a",  "apdu",      "Show APDU requests and responses"),
+        arg_lit0("v",  "verbose",   "Verbose output"),
+        arg_lit0(NULL, "txlog",     "Show detailed transaction log"),
+        arg_lit0(NULL, "json",      "Export analysis to JSON file"),
+        arg_int0("n",  "keyno",     "<dec>", "Key number"),
+        arg_str0("t",  "algo",      "<DES|2TDEA|3TDEA|AES>",  "Crypt algo"),
+        arg_str0("k",  "key",       "<hex>",   "Key for authenticate (HEX 8(DES), 16(2TDEA or AES) or 24(3TDEA) bytes)"),
+        arg_str0(NULL, "kdf",       "<none|AN10922|gallagher>",   "Key Derivation Function (KDF)"),
+        arg_str0("i",  "kdfi",      "<hex>",  "KDF input (1-31 hex bytes)"),
+        arg_str0("m",  "cmode",     "<plain|mac|encrypt>", "Communication mode"),
+        arg_str0("c",  "ccset",     "<native|niso|iso>", "Communication command set"),
+        arg_str0(NULL, "schann",    "<d40|ev1|ev2|lrp>", "Secure channel"),
+        arg_str0(NULL, "aid",       "<hex>", "Application ID (3 hex bytes, big endian)"),
+        arg_str0(NULL, "isoid",     "<hex>", "Application ISO ID (ISO DF ID) (2 hex bytes, big endian)"),
+        arg_int0(NULL, "fid",       "<dec>", "File ID (1 hex byte)"),
+        arg_param_end
+    };
+    CLIExecWithReturn(ctx, Cmd, argtable, false);
+
+    bool APDULogging = arg_get_lit(ctx, 1);
+    bool verbose = arg_get_lit(ctx, 2);
+    bool txlog = arg_get_lit(ctx, 3);
+
+    DesfireContext_t dctx;
+    int securechann = defaultSecureChannel;
+    uint32_t id = 0x000000;
+    DesfireISOSelectWay selectway = ISW6bAID;
+    int res = CmdDesGetSessionParameters(ctx, &dctx, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, &securechann, DCMPlain, &id, &selectway);
+    if (res) {
+        CLIParserFree(ctx);
+        return res;
+    }
+
+    uint8_t fileid = arg_get_int_def(ctx, 15, 1);
+
+    SetAPDULogging(APDULogging);
+    CLIParserFree(ctx);
+
+    res = DesfireSelectAndAuthenticateAppW(&dctx, securechann, selectway, id, false, verbose);
+    if (res != PM3_SUCCESS) {
+        DropField();
+        PrintAndLogEx(FAILED, "Select or authentication %s " _RED_("failed") ". Result [%d] %s", 
+                      DesfireWayIDStr(selectway, id), res, DesfireAuthErrorToStr(res));
+        return res;
+    }
+
+    if (txlog) {
+        DesfirePrintTransactionLog(&dctx, "AnalyzeTMAC", verbose);
+    }
+
+    res = DesfireAnalyzeTmacFile(&dctx, fileid, verbose);
+    if (res != PM3_SUCCESS) {
+        PrintAndLogEx(ERR, "TMAC file analysis " _RED_("failed") ". Result: %d", res);
+        DropField();
+        return PM3_ESOFT;
+    }
 
     DropField();
     return PM3_SUCCESS;
@@ -5846,6 +6182,10 @@ static command_t CommandTable[] = {
     {"createvaluefile",  CmdHF14ADesCreateValueFile,  IfPm3Iso14443a,  "Create Value File"},
     {"createrecordfile", CmdHF14ADesCreateRecordFile, IfPm3Iso14443a,  "Create Linear/Cyclic Record File"},
     {"createmacfile",    CmdHF14ADesCreateTrMACFile,  IfPm3Iso14443a,  "Create Transaction MAC File"},
+    {"gettmac",          CmdHF14ADesGetTMAC,          IfPm3Iso14443a,  "Get Transaction MAC counter and value"},
+    {"commitreaderid",   CmdHF14ADesCommitReaderID,   IfPm3Iso14443a,  "Execute CommitReaderID command"},
+    {"validatetmac",     CmdHF14ADesValidateTMAC,     IfPm3Iso14443a,  "Validate Transaction MAC context"},
+    {"analyzetmac",      CmdHF14ADesAnalyzeTMAC,      IfPm3Iso14443a,  "Analyze Transaction MAC file in human-readable format"},
     {"deletefile",       CmdHF14ADesDeleteFile,       IfPm3Iso14443a,  "Delete File"},
     {"getfilesettings",  CmdHF14ADesGetFileSettings,  IfPm3Iso14443a,  "Get file settings"},
     {"chfilesettings",   CmdHF14ADesChFileSettings,   IfPm3Iso14443a,  "Change file settings"},

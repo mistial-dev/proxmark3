@@ -456,12 +456,20 @@ static void DesfireSecureChannelEncodeEV2(DesfireContext_t *ctx, uint8_t cmd, ui
             memcpy(data, &srcdata[hdrlen], srcdatalen - hdrlen);
             data[srcdatalen - hdrlen] = 0x80; // padding
 
-            DesfireEV2FillIV(ctx, true, NULL); // fill IV to ctx
+            if (ctx->tmacContext.tmacPresent) {
+                DesfireEnhancedEV2FillIV(ctx, true, NULL, true); // enhanced IV with TMAC
+            } else {
+                DesfireEV2FillIV(ctx, true, NULL); // standard IV
+            }
             DesfireCryptoEncDec(ctx, DCOSessionKeyEnc, data, rlen, &dstdata[hdrlen], true);
         }
 
         uint8_t cmac[DESFIRE_MAX_CRYPTO_BLOCK_SIZE] = {0};
-        DesfireEV2CalcCMAC(ctx, cmd, dstdata, hdrlen + rlen, cmac);
+        if (ctx->tmacContext.tmacPresent) {
+            DesfireEnhancedEV2CalcCMAC(ctx, cmd, dstdata, hdrlen + rlen, cmac, true);
+        } else {
+            DesfireEV2CalcCMAC(ctx, cmd, dstdata, hdrlen + rlen, cmac);
+        }
 
         memcpy(&dstdata[hdrlen + rlen], cmac, DesfireGetMACLength(ctx));
 
@@ -712,7 +720,11 @@ static void DesfireSecureChannelDecodeEV2(DesfireContext_t *ctx, uint8_t *srcdat
         }
 
         if (*dstdatalen >= desfire_get_key_block_length(ctx->keyType)) {
-            DesfireEV2FillIV(ctx, false, NULL); // fill response IV to ctx
+            if (ctx->tmacContext.tmacPresent) {
+                DesfireEnhancedEV2FillIV(ctx, false, NULL, true); // enhanced response IV with TMAC
+            } else {
+                DesfireEV2FillIV(ctx, false, NULL); // standard response IV
+            }
             DesfireCryptoEncDec(ctx, DCOSessionKeyEnc, srcdata, *dstdatalen, dstdata, false);
 
             size_t puredatalen = FindISO9797M2PaddingDataLen(dstdata, *dstdatalen);

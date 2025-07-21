@@ -18,6 +18,7 @@
 #include "common.h"
 #include "proxmark3_arm.h"
 #include "string.h"
+#include <stddef.h>
 #include "BigBuf.h"
 #include "mifareutil.h"
 #include "desfire_crypto.h"
@@ -108,12 +109,21 @@ void MifareSendCommand(uint8_t *datain) {
         return;
     }
 
-    if (payload->flags & DISCONNECT)
+    // Force cleanup on DESFire error responses to prevent state corruption
+    // DESFire errors are indicated by SW1 = 0x91 followed by error code
+    // This prevents the ARM from hanging on subsequent commands after errors
+    if (len >= 2 && resp[0] == 0x91 && resp[1] != 0x00) {
+        if (g_dbglevel >= DBG_INFO) {
+            Dbprintf("DESFire error %02X detected, forcing cleanup", resp[1]);
+        }
+        // Reset field and PCB state to ensure clean state for next command
         OnSuccess();
+    } else if (payload->flags & DISCONNECT) {
+        OnSuccess();
+    }
 
     //reply_mix(CMD_ACK, 1, len, 0, resp, len);
     LED_B_ON();
-
 
     cmdres_t rpayload;
     rpayload.len = len;
@@ -149,7 +159,6 @@ void MifareDesfireGetInformation(void) {
         PCB == 0x0A because sending CID byte.
         CID == 0x00 first card?
     */
-    clear_trace();
     set_tracing(true);
     iso14443a_setup(FPGA_HF_ISO14443A_READER_LISTEN);
 
@@ -163,7 +172,6 @@ void MifareDesfireGetInformation(void) {
         }
         payload.isOK = 1;  // 2 == can not select
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         return;
     }
 
@@ -180,14 +188,12 @@ void MifareDesfireGetInformation(void) {
         print_result("ERROR <--: ", resp, len);
         payload.isOK = 3;  // 3 == DOESN'T ANSWER TO GET_VERSION
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         return;
     }
 
     if (len < sizeof(payload.versionHW) + 1) {
         payload.isOK = 3;  // 3 == DOESN'T ANSWER TO GET_VERSION
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         if (g_dbglevel >= DBG_ERROR) {
             Dbprintf("Tag answer to MFDES_GET_VERSION was too short: data in Hardware Information is probably invalid.");
             print_result("Answer", resp, len);
@@ -203,14 +209,12 @@ void MifareDesfireGetInformation(void) {
     if (!len) {
         payload.isOK = 3;  // 3 == DOESN'T ANSWER TO GET_VERSION
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         return;
     }
 
     if (len < sizeof(payload.versionSW) + 1) {
         payload.isOK = 3;  // 3 == DOESN'T ANSWER TO GET_VERSION
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         if (g_dbglevel >= DBG_ERROR) {
             Dbprintf("Tag answer to MFDES_ADDITIONAL_FRAME 1 was too short: data in Software Information is probably invalid.");
             print_result("Answer", resp, len);
@@ -225,14 +229,12 @@ void MifareDesfireGetInformation(void) {
     if (!len) {
         payload.isOK = 3;  // 3 == DOESN'T ANSWER TO GET_VERSION
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         return;
     }
 
     if (len < sizeof(payload.details) + 1) {
         payload.isOK = 3;  // 3 == DOESN'T ANSWER TO GET_VERSION
         reply_ng(CMD_HF_DESFIRE_INFO, PM3_ESOFT, (uint8_t *)&payload, sizeof(payload));
-        switch_off();
         if (g_dbglevel >= DBG_ERROR) {
             Dbprintf("Tag answer to MFDES_ADDITIONAL_FRAME 2 was too short: data in Batch number and Production date is probably invalid");
             print_result("Answer", resp, len);
@@ -246,7 +248,6 @@ void MifareDesfireGetInformation(void) {
 
     // reset the pcb_blocknum,
     pcb_blocknum = 0;
-    OnSuccess();
 }
 
 typedef struct {
